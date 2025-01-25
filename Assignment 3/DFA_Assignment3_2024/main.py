@@ -3,6 +3,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
 import matplotlib.animation as animation
+import UnscentedKalmanFilter
 
 # Constants
 WHEEL_RADIUS = 0.072 / 2  # Radius of the wheel (meters)
@@ -23,16 +24,20 @@ def add_timestamps(df, sec_col, nsec_col):
     df = df.copy()
     df['timestamp'] = pd.to_datetime(df[sec_col], unit='s') + pd.to_timedelta(df[nsec_col], unit='ns')
     df['delta_time'] = df['timestamp'].diff().dt.total_seconds()
+    df.loc[0, 'delta_time'] = 0
     return df
 
 def calculate_wheel_velocities(df):
     """Calculate linear and angular velocities from wheel data."""
     df['linear_velocity'] = (df['velocity_left'] + df['velocity_right']) * WHEEL_RADIUS / 2
+    df.loc[0, 'linear_velocity'] = 0
     df['angular_velocity'] = (df['velocity_right'] - df['velocity_left']) * WHEEL_RADIUS / WHEEL_BASE
+    df.loc[0, 'angular_velocity'] = 0
     df['delta_yaw'] = df['angular_velocity'] * df['delta_time']
 
     if 'yaw' not in df.columns:
         df['yaw'] = df['delta_yaw'].cumsum()
+    
     df['speed_x'] = df['linear_velocity'] * np.cos(df['yaw'])
     df['speed_y'] = df['linear_velocity'] * np.sin(df['yaw'])
     df['displacement_x'] = df['speed_x'] * df['delta_time']
@@ -45,9 +50,13 @@ def calculate_wheel_ticks(df):
     """Calculate velocities and positions using wheel tick data."""
     print(TICKS_PER_REVOLUTION)
     df['delta_ticks_left'] = df['ticks_left'].diff()
+    df.loc[0, 'delta_ticks_left'] = 0
     df['delta_ticks_right'] = df['ticks_right'].diff()
+    df.loc[0, 'delta_ticks_right'] = 0
     df['angular_velocity_left'] = (2 * np.pi * df['delta_ticks_left']) / (TICKS_PER_REVOLUTION * df['delta_time'])
+    df.loc[0, 'angular_velocity_left'] = 0
     df['angular_velocity_right'] = (2 * np.pi * df['delta_ticks_right']) / (TICKS_PER_REVOLUTION * df['delta_time'])
+    df.loc[0, 'angular_velocity_right'] = 0
     df['velocity_left'] = df['angular_velocity_left']
     df['velocity_right'] = df['angular_velocity_right']
     return calculate_wheel_velocities(df)
@@ -62,6 +71,10 @@ def calculate_imu_position(df):
     
     df['yaw_wrapped'] = np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
     df['yaw'] = np.unwrap(df['yaw_wrapped'])
+
+    df['acceleration_x'] = df['linear_acceleration_x'] * np.cos(df['yaw'])
+    df['acceleration_y'] = df['linear_acceleration_y'] * np.sin(df['yaw'])
+
     # Reconstruct the yaw
     df['velocity_x'] = (df['linear_acceleration_x'] * df['delta_time']).cumsum()
     df['velocity_y'] = (df['linear_acceleration_y'] * df['delta_time']).cumsum()
@@ -114,7 +127,7 @@ print(len(imu_df), len(mouse_df), len(wheel_ticks_df), len(wheel_vels_df))
 # Process Data
 imu_df = calculate_imu_position(imu_df)
 mouse_df = calculate_mouse_position(mouse_df, imu_df)
-wheel_ticks_df['yaw'] = imu_df['yaw']
+wheel_ticks_df['yaw'] = imu_df['yaw'] + 0.00029
 wheel_ticks_df = calculate_wheel_ticks(wheel_ticks_df)
 wheel_vels_df['yaw'] = imu_df['yaw']
 wheel_vels_df = calculate_wheel_velocities(wheel_vels_df)
@@ -146,7 +159,18 @@ axs[0, 1].legend()
 axs[0, 1].grid(True)
 
 # Subplot 3: IMU Linear Acceleration X over Time
-axs[1, 0].plot(imu_df['timestamp'], wheel_ticks_df['linear_velocity'], label='IMU X')
+data_df = imu_df[:170]
+print("Variance of angular_velocity_z:", data_df['angular_velocity_z'].var())
+print("Variance of linear_acceleration_x:", data_df['linear_acceleration_x'].var())
+print("Variance of linear_acceleration_y:", data_df['linear_acceleration_y'].var())
+print("Variance of orientation_z:", data_df['orientation_z'].var())
+data_df = imu_df[200:270]
+print("Variance of angular_velocity_z:", data_df['angular_velocity_z'].var())
+print("Variance of linear_acceleration_x:", data_df['linear_acceleration_x'].var())
+print("Variance of linear_acceleration_y:", data_df['linear_acceleration_y'].var())
+print("Variance of orientation_z:", data_df['orientation_z'].var())
+axs[1, 0].plot( data_df['linear_acceleration_x'], label='IMU X')
+axs[1, 0].plot( wheel_ticks_df['linear_velocity'][:800], label='IMU X')
 # axs[1, 0].plot(imu_df['timestamp'], imu_df['velocity_y'], label='IMU Y')
 # axs[1, 0].set_xlabel('Timestamp')
 axs[1, 0].set_xlabel('Timestamp')
@@ -276,6 +300,7 @@ for i in range(1, len(imu_df)):
         wheel_ticks_df['position_x'].iloc[i],
         wheel_ticks_df['position_y'].iloc[i],
         wheel_vels_df['linear_velocity'].iloc[i],
+        wheel_vels_df['angular_velocity'].iloc[i],
         imu_df['yaw'].iloc[i]
     ])
 
@@ -445,5 +470,266 @@ plt.show()
 ani.save('particle_filter_animation_with_prediction.gif', writer='pillow', fps=10)
 
 print("GIF saved as 'particle_filter_animation_with_prediction.gif'")
+
+# %%
+# --- Initialize UKF ---
+
+# State transition function (example)
+def fx(x, u, dt):
+    """
+    Predicts the next state based on the current state and control input.
+
+    Args:
+        x (numpy.ndarray): Current state vector [x, y, theta, v, omega].
+        u (numpy.ndarray): Control input vector [v_left, v_right].
+        dt (float): Time step.
+
+    Returns:
+        numpy.ndarray: Predicted state vector.
+    """
+    x_next = np.zeros_like(x)
+    v = (u[0] + u[1]) * WHEEL_RADIUS / 2  # Linear velocity
+    omega = (u[1] - u[0]) * WHEEL_RADIUS / WHEEL_BASE  # Angular velocity
+
+    x_next[0] = x[0] + v * np.cos(x[2]) * dt  # x position
+    x_next[1] = x[1] + v * np.sin(x[2]) * dt  # y position
+    x_next[2] = x[2] + omega * dt  # theta (yaw)
+    x_next[3] = v  # linear velocity
+    x_next[4] = omega  # angular velocity
+    return x_next
+
+# Measurement function (example)
+def hx(x):
+    """
+    Maps the state vector to the measurement vector.
+
+    Args:
+        x (numpy.ndarray): State vector [x, y, theta, v, omega].
+
+    Returns:
+        numpy.ndarray: Measurement vector [x, y, theta, v, omega].
+    """
+    z = np.array([
+        x[0],  # x position
+        x[1],  # y position
+        x[2],  # theta (yaw)
+        x[3],  # linear velocity
+        x[4]   # angular velocity
+    ])
+    return z
+
+dt = 0.01  # Example time step
+dim_x = 5  # State vector dimension
+dim_z = 5  # Measurement vector dimension
+
+# Define process and measurement noise (tune these!)
+process_noise = np.diag([1.1, 1.1, 0.01, 0.01, 0.01])  
+# measurement_noise = np.diag([0.1, 100.1, 10.1])  
+measurement_noise = np.diag([2.5, 2.5, 0.1, 10.1, 10.1])  
+
+ukf = UnscentedKalmanFilter.UnscentedKalmanFilter(dim_x, dim_z, dt, fx, hx, process_noise, measurement_noise)
+positions_x = []
+positions_y = []
+
+# --- Main Loop (Example) ---
+for i in range(len(imu_df)): 
+    # 1. Get control input (from wheel velocities)
+    u = np.array([wheel_vels_df['velocity_left'][i], wheel_vels_df['velocity_right'][i]])  
+
+    # 2. Predict the next state
+    ukf.predict(u)
+
+    # 3. Get measurements (from IMU, wheel encoders, etc.)
+    z = np.array([
+        wheel_ticks_df['position_x'][i], 
+        wheel_ticks_df['position_y'][i], 
+        imu_df['yaw'][i], 
+        wheel_vels_df['linear_velocity'][i], 
+        wheel_vels_df['angular_velocity'][i]
+    ])
+
+    # 4. Update the state estimate
+    ukf.update(z)
+
+    # 5. Access the estimated state (ukf.x) and covariance (ukf.P)
+    print(f"Estimated state at step {i}: {ukf.x}")
+    positions_x.append(ukf.x[0])
+    positions_y.append(ukf.x[1])
+
+# --- Visualize Results (Example) ---
+plt.plot(wheel_ticks_df['position_x'], wheel_ticks_df['position_y'], label='Wheel Ticks')
+plt.plot(tf_df['translation_x'], tf_df['translation_y'], label='Ground Truth')
+plt.plot(positions_x , positions_y, label='UKF') 
+
+plt.legend()
+plt.show()
+# %%
+from filterpy.kalman import UnscentedKalmanFilter as UKF
+from filterpy.kalman import MerweScaledSigmaPoints
+from filterpy.common import Q_discrete_white_noise
+
+def f_x(state, dt):
+    """
+    State transition function for the robot.
+
+    States:
+        x[0]: x position
+        x[1]: y position
+        x[2]: yaw
+        x[3]: linear velocity
+        x[4]: x acceleration
+        x[5]: y acceleration
+        x[6]: yaw rate 
+    """
+    x, y, yaw, v, a_x, a_y, yaw_rate = state
+
+    new_x = x + v * np.cos(yaw) * dt + 0.5 * a_x * dt**2
+    new_y = y + v * np.sin(yaw) * dt + 0.5 * a_y * dt**2
+    new_yaw = yaw + yaw_rate * dt
+    # Calculate the unit vector in the direction of the current velocity (using yaw)
+    # v_unit_x = np.cos(yaw)
+    # v_unit_y = np.sin(yaw)
+
+    # # Project the acceleration onto the velocity unit vector
+    # a_parallel = a_x * v_unit_x + a_y * v_unit_y
+
+    # # Update the velocity
+    # new_v = v + a_parallel * dt
+    new_v = v + np.sqrt(a_x**2 + a_y**2) * dt
+    return np.array([new_x, new_y, new_yaw, new_v, a_x, a_y, yaw_rate])
+
+# 2. Measurement Function
+def h_x(state):
+    """
+    Measurement function. We measure the linear velocity, yaw, acceleration_x, acceleration_y and yaw rate
+
+    States:
+        x[0]: x position
+        x[1]: y position
+        x[2]: yaw
+        x[3]: linear velocity
+        x[4]: x acceleration
+        x[5]: y acceleration
+        x[6]: yaw rate
+    """
+    return np.array([state[3], state[2], state[4], state[5], state[6]])  # [linear velocity, yaw, acceleration_x, acceleration_y, yaw_rate]
+
+# 3. Sigma Points and Weights
+points = MerweScaledSigmaPoints(n=7, alpha=0.1, beta=2.0, kappa=-1)
+
+# 4. Create UKF
+ukf = UKF(dim_x=7, dim_z=5, fx=f_x, hx=h_x, dt=imu_df['delta_time'].iloc[0], points=points)
+
+# 5. Initialize State
+# (x, y, yaw, v, a_x, a_y, yaw_rate)
+ukf.x = np.array([0., 0., imu_df['yaw'].iloc[0], wheel_vels_df['linear_velocity'].iloc[0], imu_df['acceleration_x'].iloc[0], imu_df['acceleration_y'].iloc[0], imu_df['angular_velocity_z'].iloc[0]])  
+# x, y, yaw, v, a_x, a_y, yaw_rate
+ukf.P = np.diag([
+    0.000001,  # x position variance (increase if you have no prior knowledge of initial position)
+    0.000001,  # y position variance (increase if you have no prior knowledge of initial position)
+    np.deg2rad(5)**2,  # Yaw variance (e.g., standard deviation of 5 degrees)
+    0.0001**2,  # Linear velocity variance
+    data_df['linear_acceleration_x'][:170].var(),  # a_x variance (from stationary data)
+    data_df['linear_acceleration_y'][:170].var(),  # a_y variance (from stationary data)
+    0.001**2   # Yaw rate variance
+])
+
+# 6. Measurement Noise
+ukf.R = np.diag([
+    1,  #  linear velocity variance from encoders (placeholder - needs to be determined)
+    imu_df['orientation_z'][:170].var(),  # Increased yaw variance (stationary)
+    imu_df['linear_acceleration_x'][:170].var(),    # a_x variance (stationary)
+    imu_df['linear_acceleration_y'][:170].var(),    # a_y variance (stationary)
+    imu_df['angular_velocity_z'][:170].var()  # Increased yaw rate variance (stationary)
+])
+
+print(imu_df['linear_acceleration_x'][:170].var())
+
+# 7. Process Noise
+ukf.Q = np.diag([
+    0.005 ** 2,  # x position process noise variance
+    0.005 ** 2,  # y position process noise variance
+    np.deg2rad(0.0005),  # Yaw process noise variance (tune this)
+    0.05,  # linear velocity process noise variance
+    0.5* 1e-5,   # a_x process noise variance
+    0.5* 1e-5,   # a_y process noise variance
+    1e-4   # Yaw rate process noise variance
+])
+
+# 8. Run the Filter
+z_combined = np.zeros((len(imu_df), 5))
+z_combined[:, 0] = wheel_ticks_df['linear_velocity'].values  # Use linear velocity from wheel velocities
+z_combined[:, 1] = imu_df['yaw'].values
+z_combined[:, 2] = imu_df['acceleration_x'].values
+z_combined[:, 3] = imu_df['acceleration_y'].values
+z_combined[:, 4] = imu_df['angular_velocity_z'].values
+
+# Prepare 'dts' to be used in batch_filter
+dts = imu_df['delta_time'].values
+
+# Run the filter with the combined measurements
+mu, cov = ukf.batch_filter(z_combined, dts=dts)
+
+# 9. Extract Results
+ukf_x, ukf_y, ukf_yaw, ukf_v, ukf_a_x, ukf_a_y, ukf_yaw_rate = mu[:, 0], mu[:, 1], mu[:, 2], mu[:, 3], mu[:, 4], mu[:, 5], mu[:, 6]
+
+# 10. Plot Results
+fig, axs = plt.subplots(2, 2, figsize=(15, 8))
+
+# Subplot 1: Robot Path Estimation
+axs[0, 0].plot(wheel_ticks_df['position_x'], wheel_ticks_df['position_y'], label='Wheel Ticks Odometry', linestyle='--')
+axs[0, 0].plot(wheel_vels_df['position_x'], wheel_vels_df['position_y'], label='Wheel Vels Odometry', linestyle='-.')
+axs[0, 0].plot(ukf_x, ukf_y, label='UKF Estimated Path', linestyle='-')
+axs[0, 0].plot(tf_df['translation_x'], tf_df['translation_y'], label='TF data', linestyle='-.')
+axs[0, 0].set_xlabel('X Position (m)')
+axs[0, 0].set_ylabel('Y Position (m)')
+axs[0, 0].set_title('Robot Path Estimation')
+axs[0, 0].legend()
+axs[0, 0].grid(True)
+
+# Subplot 2: UKF Linear Velocity
+axs[0,1].plot(ukf_v, label='UKF Linear Velocity', linestyle='-')
+axs[0,1].plot(wheel_ticks_df['linear_velocity'], label='Wheel ticks Linear Velocity', linestyle='-')
+axs[0,1].set_xlabel('Timestamp')
+axs[0,1].set_ylabel('Linear Velocity (m/s)')
+axs[0,1].set_title('UKF Linear Velocity over Time')
+axs[0,1].legend()
+axs[0,1].grid(True)
+
+# Subplot 3: UKF Acceleration X
+axs[1, 0].plot(ukf_a_x, label='UKF Acceleration X', linestyle='-')
+axs[1, 0].plot(imu_df['acceleration_x'], label='IMU Acceleration X', linestyle='-')
+# axs[1, 0].set_ylim(-0.1, 0.100)
+axs[1, 0].set_xlim(250, 400)
+axs[1, 0].set_xlabel('Timestamp')
+axs[1, 0].set_ylabel('Acceleration X (m/s^2)')
+axs[1, 0].set_title('UKF Acceleration X over Time')
+axs[1, 0].legend()
+axs[1, 0].grid(True)
+
+# Subplot 3: UKF Acceleration Y
+axs[1, 1].plot(ukf_a_y, label='UKF Acceleration Y', linestyle='-')
+axs[1, 1].plot(imu_df['acceleration_y'], label='IMU Acceleration Y', linestyle='-')
+axs[1, 1].set_xlim(250, 400)
+axs[1, 1].set_xlabel('Timestamp')
+axs[1, 1].set_ylabel('Acceleration Y (m/s^2)')
+axs[1, 1].set_title('UKF Acceleration Y over Time')
+axs[1, 1].legend()
+axs[1, 1].grid(True)
+
+plt.tight_layout()
+plt.show()
+
+# plt.plot(wheel_ticks_df['position_x'], wheel_ticks_df['position_y'], label='Wheel Ticks Odometry', linestyle='--')
+# plt.plot(wheel_vels_df['position_x'], wheel_vels_df['position_y'], label='Wheel Vels Odometry', linestyle='-.')
+plt.plot(ukf_x, ukf_y, label='UKF Estimated Path', linestyle='-')
+plt.plot(tf_df['translation_x'], tf_df['translation_y'], label='TF data', linestyle='-.')
+plt.xlabel('X Position (m)')
+plt.ylabel('Y Position (m)')
+plt.title('Robot Path Estimation')
+plt.legend()
+plt.grid(True)
+
+plt.show()
 
 # %%
