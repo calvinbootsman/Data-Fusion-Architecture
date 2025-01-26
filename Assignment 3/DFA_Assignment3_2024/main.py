@@ -3,7 +3,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
 import matplotlib.animation as animation
-
+import scipy.stats
 # Constants
 WHEEL_RADIUS = 0.072 / 2  # Radius of the wheel (meters)
 WHEEL_BASE = 0.235        # Distance between wheels (meters)
@@ -276,20 +276,20 @@ ukf.P = np.diag([
 
 # 6. Measurement Noise
 ukf.R = np.diag([
-    0.004 ** 2,  #  linear velocity variance from encoders (placeholder - needs to be determined)
+    0.05 ** 2,  #  linear velocity variance from encoders (placeholder - needs to be determined)
     imu_df['orientation_z'][:170].var(),  # Increased yaw variance (stationary)
     imu_df['linear_acceleration_x'][:170].var(),    # a_x variance (stationary)
     imu_df['linear_acceleration_y'][:170].var(),    # a_y variance (stationary)
-    imu_df['angular_velocity_z'][:170].var()  # Increased yaw rate variance (stationary)
+    imu_df['angular_velocity_z'][:170].var() * 1e2  # Increased yaw rate variance (stationary)
 ])
 
-print(imu_df['linear_acceleration_x'][:170].var())
+print(imu_df['angular_velocity_z'][:170].var())
 
 # 7. Process Noise
 ukf.Q = np.diag([
     0.05 ** 2,  # x position process noise variance
     0.05 ** 2,  # y position process noise variance
-    np.deg2rad(1) ** 2,  # Yaw process noise variance 
+    np.deg2rad(5) ** 2,  # Yaw process noise variance 
     0.5 ** 2,  # linear velocity process noise variance
     (1 * 1e-2) ** 2,   # a_x process noise variance
     (1* 1e-2) ** 2 ,   # a_y process noise variance
@@ -373,3 +373,137 @@ plt.grid(True)
 plt.show()
 
 # %%
+# Constants
+DELTA_T = 0.01  # Time step (seconds)
+AREA_LIMIT = 3.0  # 3x3 square
+NUM_PARTICLES = 15000  # Initial number of particles
+MOTION_NOISE = [0.1, 0.1, np.deg2rad(1)]  # Noise in [x, y, theta]
+LANDMARKS = [[1.5, 0.75], [2.75, 1.5], [1.75, 2.25], [0.5, 1.25]]  # Landmarks in the area
+START_FRAME = 200  # Start frame for the animation
+END_FRAME = 210  # End frame for the animation
+
+# Particle Filter Class
+class ParticleFilter:
+    def __init__(self, num_particles, area_limit):
+        self.num_particles = num_particles
+        self.area_limit = area_limit
+        self.particles = self.create_uniform_particles((0, area_limit), (0, area_limit), (-np.pi, np.pi), num_particles)
+        self.weights = np.ones(num_particles) / num_particles
+
+    def create_uniform_particles(self, x_range, y_range, hdg_range, N):
+        """Initialize particles uniformly."""
+        particles = np.empty((N, 3))
+        particles[:, 0] = np.random.uniform(x_range[0], x_range[1], size=N)
+        particles[:, 1] = np.random.uniform(y_range[0], y_range[1], size=N)
+        particles[:, 2] = np.random.uniform(hdg_range[0], hdg_range[1], size=N)
+        particles[:, 2] %= 2 * np.pi
+        return particles
+
+    def predict(self, control_input):
+        """Propagate particles using the motion model with noise."""
+        v, yaw = control_input  # Linear and angular velocity
+        noise = np.random.normal(0, MOTION_NOISE, (self.num_particles, 3))
+        self.particles[:, 2] += yaw + noise[:, 2]  # Update theta
+        self.particles[:, 0] += (v * np.cos(self.particles[:, 2]) * DELTA_T + noise[:, 0])  # Update x
+        self.particles[:, 1] += (v * np.sin(self.particles[:, 2]) * DELTA_T + noise[:, 1])  # Update y
+        self.particles[:, 0] = np.clip(self.particles[:, 0], 0, self.area_limit)  # Clamp x
+        self.particles[:, 1] = np.clip(self.particles[:, 1], 0, self.area_limit)  # Clamp y
+
+    def update(self, measurements, measurement_noise, landmarks):
+        """Update particle weights based on measurements to landmarks."""
+        for i, landmark in enumerate(landmarks):
+            distances = np.linalg.norm(self.particles[:, :2] - landmark, axis=1)
+            self.weights *= scipy.stats.norm(distances, measurement_noise[0]).pdf(measurements[i])
+        self.weights += 1.e-300  # Avoid division by zero
+        self.weights /= np.sum(self.weights)  # Normalize weights
+
+    def neff(self):
+        """Compute the effective number of particles."""
+        return 1. / np.sum(np.square(self.weights))
+
+    def resample(self):
+        """Perform resampling using systematic resampling."""
+        N = len(self.weights)
+        positions = (np.random.rand() + np.arange(N)) / N
+        indexes = np.zeros(N, 'i')
+        cumulative_sum = np.cumsum(self.weights)
+        i, j = 0, 0
+        while i < N:
+            if positions[i] < cumulative_sum[j]:
+                indexes[i] = j
+                i += 1
+            else:
+                j += 1
+        self.particles = self.particles[indexes]
+        self.weights.fill(1.0 / N)
+
+    def estimate(self):
+        """Estimate the state as the weighted mean of the particles."""
+        mean = np.average(self.particles, weights=self.weights, axis=0)
+        var = np.average((self.particles - mean)**2, weights=self.weights, axis=0)
+        return mean, var
+
+# Simulate Landmark Measurements
+def simulate_landmark_measurements(ground_truth, landmarks, noise_std):
+    """Simulate measurements from the ground truth position to landmarks."""
+    measurements = []
+    for landmark in landmarks:
+        distance = np.sqrt((ground_truth[0] - landmark[0])**2 + (ground_truth[1] - landmark[1])**2)
+        noisy_distance = distance + np.random.normal(0, noise_std)
+        measurements.append(noisy_distance)
+    return measurements
+
+
+
+# Initialize Particle Filter
+pf = ParticleFilter(NUM_PARTICLES, AREA_LIMIT)
+
+# Load tf_data
+tf_x, tf_y, tf_yaw, tf_v = ukf_x[START_FRAME:END_FRAME], ukf_y[START_FRAME:END_FRAME], ukf_yaw[START_FRAME:END_FRAME], ukf_v[START_FRAME:END_FRAME]   
+ground_truth = np.vstack((tf_x, tf_y, tf_yaw)).T
+
+# Initialize Particle Filter
+fig, ax = plt.subplots(figsize=(8, 8))
+landmark_scatter = ax.scatter([l[0] for l in LANDMARKS], [l[1] for l in LANDMARKS],
+                            color='green', label='Landmarks', s=100)
+particles_scatter = ax.scatter([], [], s=[], alpha=0.4, label='Particles')
+ground_truth_scatter = ax.scatter([], [], color='red', label='Ground Truth', s=100)
+predicted_scatter = ax.scatter([], [], color='blue', marker='x', label='Prediction', s=100)
+ax.set_xlim(-0.5, AREA_LIMIT + 0.5)
+ax.set_ylim(-0.5, AREA_LIMIT + 0.5)
+ax.set_xlabel('X Position (m)')
+ax.set_ylabel('Y Position (m)')
+ax.legend()
+ax.grid()
+
+# Animation update function
+def update(frame):
+    #  For the first frame, just show the initial particle distribution
+    if frame == 0:
+        particles_scatter.set_offsets(pf.particles[:, :2])
+        particles_scatter.set_sizes(np.full(pf.num_particles, 100)) 
+        return particles_scatter, 
+
+    # For subsequent frames, proceed with the particle filter steps
+    control_input = [tf_v[frame], tf_yaw[frame]] 
+    measurement = simulate_landmark_measurements(ground_truth[frame], LANDMARKS, noise_std=0.5)
+
+    pf.predict(control_input)
+    pf.update(measurement, measurement_noise=[0.5], landmarks=LANDMARKS)
+    pf.resample()
+
+    estimated_mean, _ = pf.estimate()
+
+    particles_scatter.set_offsets(pf.particles[:, :2])
+    particles_scatter.set_sizes(np.full(pf.num_particles, 100))
+    ground_truth_scatter.set_offsets([ground_truth[frame, 0], ground_truth[frame, 1]])
+    predicted_scatter.set_offsets([estimated_mean[0], estimated_mean[1]])
+
+    return particles_scatter, ground_truth_scatter, predicted_scatter
+
+ani = animation.FuncAnimation(fig, update, frames=len(ground_truth), interval=200, blit=False)
+
+# Save as GIF
+ani.save('adaptive_particle_filter_uniform.gif', writer='pillow', fps=3)
+
+print("GIF saved as 'adaptive_particle_filter_uniform.gif'")
